@@ -304,13 +304,15 @@ export function application({ db, storage, getUser, BackendError }) {
       creator_uid: prof?.uid || '',
       moment_count: room.moment_count, created_at: room.created_at,
       cover_url: cover || null, is_creator: isActor(ident, room.creator_id),
+      is_seed: typeof room.creator_id === 'string' && room.creator_id.startsWith('seed:'),
       code: room.visibility === 'private' ? room.code : null,
       share_code: room.visibility === 'private' ? room.share_code : null,
     };
   }
 
   async function roomView(room, ident) {
-    const moments = rows(await db.from('moments').select(MOMENT_COLS).eq('room_id', room.id).eq('status', 'ready').order('created_at', { ascending: false }).limit(120)) || [];
+    const rawMoments = rows(await db.from('moments').select(MOMENT_COLS).eq('room_id', room.id).eq('status', 'ready').order('created_at', { ascending: false }).limit(120)) || [];
+    const moments = [...rawMoments].sort((a, b) => Number(Boolean(a.seed_key)) - Number(Boolean(b.seed_key)));
     const images = await signImages(moments);
     const state = await myState(room, ident);
     state.voterId = ident.id;
@@ -552,7 +554,8 @@ export function application({ db, storage, getUser, BackendError }) {
       const queryCodes = (url.searchParams.get('codes') || '').split(',').map(v => v.trim()).filter(isCode);
       const accountCodes = ident.account && Array.isArray(ident.account.unlocked_codes) ? ident.account.unlocked_codes.filter(isCode) : [];
       const codes = [...new Set([...accountCodes, ...queryCodes])].slice(0, 12);
-      const publicRooms = rows(await db.from('rooms').select(ROOM_COLS).eq('visibility', 'public').order('created_at', { ascending: false }).limit(60)) || [];
+      const rawPublicRooms = rows(await db.from('rooms').select(ROOM_COLS).eq('visibility', 'public').order('created_at', { ascending: false }).limit(60)) || [];
+      const publicRooms = [...rawPublicRooms].sort((a, b) => Number(String(a.creator_id || '').startsWith('seed:')) - Number(String(b.creator_id || '').startsWith('seed:')));
       const unlocked = [];
       for (const code of codes) {
         const room = await one('rooms', ROOM_COLS, [['code', code]]);

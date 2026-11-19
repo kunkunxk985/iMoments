@@ -164,7 +164,10 @@ export function Room({ slug, route, version, account, onTheme }: { slug: string;
       .forEach((moment, index) => map.set(moment.id, index + 1));
     return map;
   }, [moments, showsVotes]);
-  const filtered = useMemo(() => tag === "all" ? moments : moments.filter(moment => moment.tag === tag), [moments, tag]);
+  const filtered = useMemo(() => {
+    const list = tag === "all" ? moments : moments.filter(moment => moment.tag === tag);
+    return [...list].sort((a, b) => Number(Boolean(a.seed_key)) - Number(Boolean(b.seed_key)));
+  }, [moments, tag]);
   const lightboxList = filtered.some(moment => moment.id === openId) ? filtered : moments;
   const lightboxIndex = lightboxList.findIndex(moment => moment.id === openId);
   const tagCounts = useMemo(() => {

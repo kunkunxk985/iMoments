@@ -59,9 +59,13 @@ export function Plaza({ route, version, account }: { route: Route; version: numb
       ? all.filter(room => [room.title, room.tagline, room.creator_name, ...room.tags].join(" ").toLowerCase().includes(needle))
       : all;
     const filtered = mode === "all" ? matched : matched.filter(room => room.mode === mode);
-    return [...filtered].sort((a, b) => sort === "new"
-      ? Date.parse(b.created_at) - Date.parse(a.created_at)
-      : (b.moment_count - a.moment_count) || (Date.parse(b.created_at) - Date.parse(a.created_at)));
+    return [...filtered].sort((a, b) => {
+      const seedDiff = Number(a.is_seed) - Number(b.is_seed);
+      if (seedDiff !== 0) return seedDiff;
+      return sort === "new"
+        ? Date.parse(b.created_at) - Date.parse(a.created_at)
+        : (b.moment_count - a.moment_count) || (Date.parse(b.created_at) - Date.parse(a.created_at));
+    });
   }, [data, mode, sort, query]);
 
   return (

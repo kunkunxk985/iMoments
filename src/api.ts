@@ -10,7 +10,7 @@ export type Room = {
   tags: string[]; revealed: boolean; ai_curator_note: string;
   creator_name: string; creator_avatar: string; creator_handle: string; creator_uid: string;
   moment_count: number; created_at: string;
-  cover_url: string | null; is_creator: boolean; code: string | null; share_code: string | null;
+  cover_url: string | null; is_creator: boolean; is_seed: boolean; code: string | null; share_code: string | null;
 };
 export type Moment = {
   id: string; author_name: string; author_avatar: string; author_handle: string; author_uid: string;
@@ -130,6 +130,7 @@ function room(value: unknown): Room {
     moment_count: num(value.moment_count), created_at: str(value.created_at),
     cover_url: typeof value.cover_url === "string" ? value.cover_url : null,
     is_creator: bool(value.is_creator),
+    is_seed: bool(value.is_seed),
     code: typeof value.code === "string" ? value.code : null,
     share_code: typeof value.share_code === "string" ? value.share_code : null,
   };
