@@ -638,7 +638,7 @@ export function application({ db, storage, getUser, BackendError }) {
           const fails = fresh ? Number(gate.fails) + 1 : 1;
           rows(await db.from('gate_attempts').update({ fails, window_start: new Date().toISOString() }).eq('id', gate.id).eq('fails', Number(gate.fails)).select('id'));
         } else {
-          rows(await db.from('gate_attempts').insertIfAbsent({ ...stamp(), room_id: GATE_ALL, voter_id: voterId, fails: 1, window_start: new Date().toISOString() }, { onConflict: 'room_id,voter_id' }).select('id'));
+          rows(await db.from('gate_attempts').insertIfAbsent({ id: crypto.randomUUID(), room_id: GATE_ALL, voter_id: voterId, fails: 1, window_start: new Date().toISOString() }, { onConflict: 'room_id,voter_id' }).select('id'));
         }
         fail('code_not_found', 404);
       }
