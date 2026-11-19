@@ -1,5 +1,5 @@
 import type { ImageTelemetry } from "@/src/lib/image";
-import type { ModeId, ThemeId, Visibility } from "@/src/theme";
+import type { ModeId, ThemeId, Visibility } from "@/src/config/theme";
 
 export const SEED_ROOM_NOTES: Record<string, string> = {
   "sunset-1815": "本场共收录 6 座城市的黄昏切片：阿柚在上海徐汇滨江抓住了“橘子汽水色天际线”的最高人气共鸣，小满的厦门退潮镜面海滩与林一凡的里斯本天台光格紧随其后——同一轮太阳在不同经纬度的窗框里缓缓退场，拼成了一封不肯天黑的平行情书。",
@@ -55,10 +55,15 @@ export function getCachedMomentAi(id: string): { score?: number; caption?: strin
   } catch { return null; }
 }
 
+const FALLBACK_SEEDS = [
+  "老城区黄昏菜市场", "雨夜便利店橱窗", "校园天台吹晚风", "周末绿皮火车窗外", "胡同口晒太阳的猫", "清晨第一杯热美式",
+];
+
 export function localGenerateVibe(rawInput: string): {
   title: string; tagline: string; theme: ThemeId; mode: ModeId; visibility: Visibility; tags: string[]; reason: string;
 } {
-  const seed = rawInput.trim().slice(0, 40) || "此刻眼前的微光";
+  const randomPick = FALLBACK_SEEDS[Math.floor(Math.random() * FALLBACK_SEEDS.length)];
+  const seed = rawInput.trim().slice(0, 40) || randomPick;
   const clusters: { match: RegExp; theme: ThemeId; mode: ModeId; visibility: Visibility; tagline: (t: string) => string; tags: string[]; reason: string }[] = [
     { match: /落日|夕阳|黄昏|日落|晚霞|日出|天空|云海|余晖/, theme: "amber", mode: "gentle", visibility: "public", tagline: t => `在「${t}」里把抬头撞见的那束光留存下来，跨过城市山海拼成一场不落幕的黄昏展。`, tags: ["城市天际", "海边余晖", "窗边一角", "漫天晚霞"], reason: "识别到天际光影意象，已配齐「落日琥珀」色板与温柔共赏模式。" },
     { match: /秋|银杏|枫叶|落叶|桂花|金秋/, theme: "ginkgo", mode: "gentle", visibility: "public", tagline: t => `收集散落在各地街角与山林的秋意切片，让每一片金黄都在「${t}」里慢下来。`, tags: ["银杏大道", "落叶特写", "秋日风物", "山林层染"], reason: "识别到秋日风物色彩，已匹配「银杏暖金」与四维秋景分栏。" },

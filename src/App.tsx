@@ -1,16 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
-import { Toaster } from "@/components/ui/sonner";
+import { toast } from "sonner";
+import { Toaster } from "@/src/components/Toaster";
 import { api, type Account } from "@/src/api";
 import { useRoute, setParams } from "@/src/lib/router";
 import { cachedAccount, clearAccountToken, setCachedAccount } from "@/src/lib/visitor";
-import { themeClass, plazaThemeFor, type ThemeId } from "@/src/theme";
+import { themeClass, plazaThemeFor, type ThemeId } from "@/src/config/theme";
 import { Nav } from "@/src/components/Nav";
-import { Plaza } from "@/src/components/Plaza";
-import { Room } from "@/src/components/Room";
-import { CreateRoom } from "@/src/components/CreateRoom";
-import { CodeGate } from "@/src/components/CodeGate";
-import { CreditsDialog } from "@/src/components/CreditsDialog";
-import { AccountDialog } from "@/src/components/AccountDialog";
+import { Plaza } from "@/src/pages/Plaza";
+import { Room } from "@/src/pages/Room";
+import { CreateRoom } from "@/src/dialogs/CreateRoom";
+import { CodeGate } from "@/src/dialogs/CodeGate";
+import { CreditsDialog } from "@/src/dialogs/CreditsDialog";
+import { AccountDialog } from "@/src/dialogs/AccountDialog";
 
 export default function App() {
   const route = useRoute();
@@ -49,17 +50,24 @@ export default function App() {
     if (route.name === "plaza") document.title = "iMoments · 拾光房间 — 主题瞬间共创与互动打榜";
   }, [route.name]);
 
+  useEffect(() => {
+    if (route.params.get("create") === "1" && !account) {
+      toast("请先注册或登录拾光账号后再创办活动");
+      setParams({ create: null, account: "1" });
+    }
+  }, [route.params, account]);
+
   return (
     <div className={`g-shell ${themeClass(route.name === "room" ? theme : plazaTheme)}`}>
       <div className="g-bg" aria-hidden="true" />
       <Nav route={route} account={account} />
       <main className="g-main">
         {route.name === "room" && route.slug
-          ? <Room slug={route.slug} route={route} version={version} onTheme={onTheme} />
-          : <Plaza route={route} version={version} />}
+          ? <Room slug={route.slug} route={route} version={version} account={account} onTheme={onTheme} />
+          : <Plaza route={route} version={version} account={account} />}
       </main>
 
-      {route.params.get("create") === "1" ? <CreateRoom onClose={() => setParams({ create: null })} onCreated={bump} /> : null}
+      {route.params.get("create") === "1" && account ? <CreateRoom account={account} onClose={() => setParams({ create: null })} onCreated={bump} /> : null}
       {route.params.get("gate") === "1" ? <CodeGate onClose={() => setParams({ gate: null })} onUnlocked={bump} /> : null}
       {route.params.get("credits") === "1" ? <CreditsDialog onClose={() => setParams({ credits: null })} /> : null}
       {route.params.get("account") === "1" ? (

@@ -2,7 +2,7 @@
 // Dependency injection exists only for the local fixture runner; index.ts keeps Deno.serve.
 // Object paths, visitor identity and counters are never taken from client claims alone.
 import { ensureSeed } from './seed.mjs';
-import { generateRoomVibe, judgeMomentSubmission, generateRoomAward } from './ai.mjs';
+import { generateRoomVibe, judgeMomentSubmission, generateRoomAward, hasUnsafeText } from './ai.mjs';
 import {
   hashPassword, isValidAvatar, isValidHandle, isValidPassword,
   normalizeHandle, publicAccount, randomHex, sha256Hex, shortUid, verifyPassword,
@@ -20,6 +20,9 @@ const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const MAX_FULL = 8 * 1024 * 1024;
 const MAX_THUMB = 1.5 * 1024 * 1024;
 const MAX_ORIGINAL = 10 * 1024 * 1024; // platform Storage per-object ceiling (10 MiB)
+const MAX_CHUNKED_ORIGINAL = 60 * 1024 * 1024; // chunked lossless original ceiling (60 MiB)
+const MAX_PARTS = 7;
+const PART_COLS = 'id,moment_id,part_index,total_parts,object_path,byte_size,total_size,content_type,sha256,created_at';
 const GATE_ALL = '00000000-0000-4000-8000-000000000000';
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -57,6 +60,9 @@ export function application({ db, storage, getUser, BackendError }) {
   }
 
   async function resolveIdentity(ctx) {
+    const rawVisitorKey = ctx.request.headers.get('x-visitor-key');
+    const visitorId = isUuid(rawVisitorKey) ? `v:${rawVisitorKey}` : null;
+
     // 1. Cross-device iMoments Account Session Token (works across phone & desktop)
     const rawToken = ctx.request.headers.get('x-account-token');
     if (rawToken && /^[a-f0-9]{48,96}$/.test(rawToken)) {
@@ -68,6 +74,7 @@ export function application({ db, storage, getUser, BackendError }) {
           if (account) {
             return {
               id: `u:${account.id}`,
+              visitorId,
               name: account.display_name,
               avatar_url: account.avatar_url || '',
               authenticated: true,
@@ -88,6 +95,7 @@ export function application({ db, storage, getUser, BackendError }) {
     if (user?.user_id) {
       return {
         id: `u:${user.user_id}`,
+        visitorId,
         name: typeof user.name === 'string' ? user.name.slice(0, 24) : '',
         avatar_url: typeof user.picture === 'string' ? user.picture : '',
         authenticated: true,
@@ -97,11 +105,11 @@ export function application({ db, storage, getUser, BackendError }) {
     }
 
     // 3. Anonymous device visitor UUID
-    const key = ctx.request.headers.get('x-visitor-key');
-    if (isUuid(key)) return { id: `v:${key}`, name: '', avatar_url: '', authenticated: false, account: null, sessionId: null };
-    return { id: null, name: '', avatar_url: '', authenticated: false, account: null, sessionId: null };
+    if (visitorId) return { id: visitorId, visitorId, name: '', avatar_url: '', authenticated: false, account: null, sessionId: null };
+    return { id: null, visitorId: null, name: '', avatar_url: '', authenticated: false, account: null, sessionId: null };
   }
-  const requireVisitor = ident => { if (!ident.id) fail('visitor_required', 400); return ident.id; };
+  const requireAccount = ident => { if (!ident?.authenticated || !ident?.id) fail('login_required', 401); return ident.id; };
+  const isActor = (ident, ownerId) => Boolean(ident?.authenticated && ident?.id && ownerId && ownerId === ident.id);
 
   async function createSession(accountId) {
     const token = randomHex(32);
@@ -155,7 +163,7 @@ export function application({ db, storage, getUser, BackendError }) {
   async function roomBySlug(slug) {
     if (typeof slug !== 'string' || !/^[a-z0-9-]{3,40}$/.test(slug)) fail('invalid_input', 400);
     const room = await one('rooms', ROOM_COLS, [['slug', slug]]);
-    if (!room) fail('not_found', 404);
+    if (!room || room.visibility === 'deleted') fail('not_found', 404);
     return room;
   }
   function roomCode(request) {
@@ -164,7 +172,7 @@ export function application({ db, storage, getUser, BackendError }) {
   }
   function assertAccess(room, ident, code) {
     if (room.visibility === 'public') return;
-    if (ident.id && room.creator_id === ident.id) return;
+    if (isActor(ident, room.creator_id)) return;
     if (ident.account && Array.isArray(ident.account.unlocked_codes) && room.code && ident.account.unlocked_codes.includes(room.code)) return;
     if (code && (code === room.code || code === room.share_code)) return;
     fail('room_locked', 403);
@@ -219,11 +227,12 @@ export function application({ db, storage, getUser, BackendError }) {
       try {
         const full = await storage.createSignedUrl(moment.object_path, 3600);
         const thumb = moment.thumb_path ? await storage.createSignedUrl(moment.thumb_path, 3600) : full;
-        const orig = moment.original_path ? await storage.createSignedUrl(moment.original_path, 3600) : null;
+        const isChunked = typeof moment.original_path === 'string' && moment.original_path.startsWith('chunked:');
+        const orig = moment.original_path && !isChunked ? await storage.createSignedUrl(moment.original_path, 3600) : null;
         map.set(moment.id, {
           image_url: full.signedUrl,
           thumb_url: thumb.signedUrl,
-          original_url: orig ? orig.signedUrl : full.signedUrl,
+          original_url: isChunked ? null : (orig ? orig.signedUrl : full.signedUrl),
         });
       } catch { fail('storage_unavailable', 503); }
     }
@@ -237,7 +246,7 @@ export function application({ db, storage, getUser, BackendError }) {
   }
 
   async function myState(room, ident) {
-    if (!ident.id) return { liked: [], voted: [], used: 0, remaining: BALLOTS };
+    if (!ident?.authenticated || !ident.id) return { liked: [], voted: [], used: 0, remaining: BALLOTS };
     // Sequential reads: the injected database client is not safe for concurrent requests.
     const likes = rows(await db.from('likes').select('moment_id').eq('room_id', room.id).eq('voter_id', ident.id).eq('active', true).limit(200));
     const votes = rows(await db.from('votes').select('moment_id').eq('room_id', room.id).eq('voter_id', ident.id).eq('active', true).limit(20));
@@ -257,6 +266,7 @@ export function application({ db, storage, getUser, BackendError }) {
     const origW = Number(moment.original_width) || moment.width;
     const origH = Number(moment.original_height) || moment.height;
     const prof = profiles?.get(moment.author_id);
+    const isChunked = typeof moment.original_path === 'string' && moment.original_path.startsWith('chunked:');
     return {
       id: moment.id,
       author_name: prof?.display_name || moment.author_name,
@@ -267,7 +277,8 @@ export function application({ db, storage, getUser, BackendError }) {
       width: moment.width, height: moment.height,
       original_width: origW, original_height: origH,
       has_original: Boolean(moment.original_path || moment.seed_key),
-      ai_score: typeof moment.ai_score === 'number' && moment.ai_score > 0 ? moment.ai_score : 94,
+      original_chunked: isChunked,
+      ai_score: typeof moment.ai_score === 'number' && moment.ai_score > 0 ? moment.ai_score : 0,
       ai_caption: typeof moment.ai_caption === 'string' ? moment.ai_caption : '',
       likes: moment.likes, comment_count: moment.comment_count,
       votes: showsVotes(room) ? moment.votes : null,
@@ -275,10 +286,10 @@ export function application({ db, storage, getUser, BackendError }) {
       created_at: moment.created_at, seed_key: moment.seed_key || null,
       image_url: urls.image_url || null,
       thumb_url: urls.thumb_url || urls.image_url || null,
-      original_url: urls.original_url || urls.image_url || null,
+      original_url: isChunked ? null : (urls.original_url || urls.image_url || null),
       liked: state.liked.includes(moment.id), voted: state.voted.includes(moment.id),
-      mine: !!state.voterId && moment.author_id === state.voterId,
-      can_delete: !!state.voterId && (moment.author_id === state.voterId || room.creator_id === state.voterId),
+      mine: isActor(state.ident, moment.author_id),
+      can_delete: isActor(state.ident, moment.author_id) || isActor(state.ident, room.creator_id),
     };
   }
   function publicRoom(room, cover, ident, profiles) {
@@ -292,7 +303,7 @@ export function application({ db, storage, getUser, BackendError }) {
       creator_handle: prof?.handle || '',
       creator_uid: prof?.uid || '',
       moment_count: room.moment_count, created_at: room.created_at,
-      cover_url: cover || null, is_creator: !!ident?.id && room.creator_id === ident.id,
+      cover_url: cover || null, is_creator: isActor(ident, room.creator_id),
       code: room.visibility === 'private' ? room.code : null,
       share_code: room.visibility === 'private' ? room.share_code : null,
     };
@@ -303,6 +314,7 @@ export function application({ db, storage, getUser, BackendError }) {
     const images = await signImages(moments);
     const state = await myState(room, ident);
     state.voterId = ident.id;
+    state.ident = ident;
     const ranks = rankMap(moments);
     const profiles = await loadProfiles([room.creator_id, ...moments.map(m => m.author_id)]);
     const items = moments.map(moment => publicMoment(moment, images, state, room, ranks, profiles));
@@ -347,6 +359,29 @@ export function application({ db, storage, getUser, BackendError }) {
         if (size > maxBytes) fail('invalid_upload', 422);
       }
       if (size === 0) fail('invalid_upload', 422);
+      return size;
+    } catch (error) {
+      if (error instanceof BackendError) throw error;
+      fail('storage_unavailable', 503);
+    } finally { clearTimeout(timer); await reader.cancel().catch(() => {}); reader.releaseLock(); }
+  }
+
+  async function verifyChunk(objectPath, expectedBytes) {
+    let response;
+    try { response = await storage.download(objectPath); }
+    catch (error) { if (error?.code === 'storage_object_not_found') fail('upload_pending', 409); fail('storage_unavailable', 503); }
+    if (!response.ok || !response.body) { await response.body?.cancel(); fail('invalid_upload', 422); }
+    const reader = response.body.getReader(); let size = 0, timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; void reader.cancel().catch(() => {}); }, 25000);
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (timedOut) fail('storage_unavailable', 503);
+        if (done) break;
+        size += value.byteLength;
+        if (size > MAX_ORIGINAL) fail('invalid_upload', 422);
+      }
+      if (size !== expectedBytes || size === 0) fail('invalid_upload', 422);
       return size;
     } catch (error) {
       if (error instanceof BackendError) throw error;
@@ -495,14 +530,20 @@ export function application({ db, storage, getUser, BackendError }) {
       return Response.json({ account: publicAccount(updated[0]) });
     }
 
-    // AI Capability 1: One-sentence Room Vibe Architect
+    // AI Capability 1: One-sentence Room Vibe Architect & Live AI Random Inspiration
     if (path === '/api/ai/vibe' && method === 'POST') {
-      requireVisitor(ident);
+      requireAccount(ident);
       const body = await input(request);
+      const surprise = body?.surprise === true;
       const prompt = typeof body?.prompt === 'string' ? body.prompt.trim().slice(0, 60) : '';
-      if (!prompt) fail('invalid_input', 400);
-      const vibe = await generateRoomVibe(prompt);
-      return Response.json({ vibe });
+      if (!prompt && !surprise) fail('invalid_input', 400);
+      const avoid = Array.isArray(body?.avoid) ? body.avoid.slice(0, 8) : [];
+      try {
+        const vibe = await generateRoomVibe(prompt, { surprise, avoid });
+        return Response.json({ vibe });
+      } catch (err) {
+        fail(err?.code || 'ai_unavailable', err?.status || 503);
+      }
     }
 
     if (path === '/api/rooms' && method === 'GET') {
@@ -535,7 +576,7 @@ export function application({ db, storage, getUser, BackendError }) {
 
     if (path === '/api/rooms' && method === 'POST') {
       await seeded();
-      const voterId = requireVisitor(ident);
+      const voterId = requireAccount(ident);
       const body = await input(request);
       const key = request.headers.get('idempotency-key');
       if (!isUuid(key)) fail('invalid_input', 400);
@@ -607,37 +648,46 @@ export function application({ db, storage, getUser, BackendError }) {
       return Response.json({ room: publicRoom(room, await coverUrl(room), ident, profiles) });
     }
 
-    // AI Capability 2: Pre-upload Multimodal Topic Resonance Judge & Polaroid Caption
+    // AI Capability 2: Real Multimodal Vision Judge & Polaroid Caption (glm-4v-flash)
     const aiJudgeRoute = path.match(/^\/api\/rooms\/([a-z0-9-]{3,40})\/ai-judge$/);
     if (aiJudgeRoute && method === 'POST') {
       await seeded();
-      requireVisitor(ident);
+      requireAccount(ident);
       const room = await roomBySlug(aiJudgeRoute[1]);
       assertAccess(room, ident, roomCode(request));
-      const body = await input(request);
-      const verdict = await judgeMomentSubmission({
-        room,
-        tag: typeof body?.tag === 'string' ? body.tag.slice(0, 16) : '',
-        place: typeof body?.place === 'string' ? body.place.slice(0, 40) : '',
-        story: typeof body?.story === 'string' ? body.story.slice(0, 140) : '',
-        fileName: typeof body?.file_name === 'string' ? body.file_name.slice(0, 80) : '',
-        telemetry: body?.telemetry,
-      });
-      return Response.json({ verdict });
+      const body = await input(request, 320 * 1024);
+      const imageDataUrl = typeof body?.image_data_url === 'string' && body.image_data_url.length <= 260 * 1024 ? body.image_data_url : '';
+      try {
+        const verdict = await judgeMomentSubmission({
+          room,
+          tag: typeof body?.tag === 'string' ? body.tag.slice(0, 16) : '',
+          place: typeof body?.place === 'string' ? body.place.slice(0, 40) : '',
+          story: typeof body?.story === 'string' ? body.story.slice(0, 140) : '',
+          fileName: typeof body?.file_name === 'string' ? body.file_name.slice(0, 80) : '',
+          imageDataUrl,
+        });
+        return Response.json({ verdict });
+      } catch (err) {
+        fail(err?.code || 'ai_unavailable', err?.status || 503);
+      }
     }
 
     // AI Capability 3: Room Chief Curator Summary & TOP 3 Award Speech
     const aiAwardRoute = path.match(/^\/api\/rooms\/([a-z0-9-]{3,40})\/ai-award$/);
     if (aiAwardRoute && method === 'POST') {
       await seeded();
-      requireVisitor(ident);
+      requireAccount(ident);
       const room = await roomBySlug(aiAwardRoute[1]);
       assertAccess(room, ident, roomCode(request));
       const moments = rows(await db.from('moments').select(MOMENT_COLS).eq('room_id', room.id).eq('status', 'ready').limit(120)) || [];
       const recentComments = rows(await db.from('comments').select('id,author_name,body,created_at').eq('room_id', room.id).order('created_at', { ascending: false }).limit(12)) || [];
-      const note = await generateRoomAward({ room, moments, topComments: recentComments });
-      rows(await db.from('rooms').update({ ai_curator_note: note }).eq('id', room.id).select('id,ai_curator_note'));
-      return Response.json({ ai_curator_note: note });
+      try {
+        const note = await generateRoomAward({ room, moments, topComments: recentComments });
+        rows(await db.from('rooms').update({ ai_curator_note: note }).eq('id', room.id).select('id,ai_curator_note'));
+        return Response.json({ ai_curator_note: note });
+      } catch (err) {
+        fail(err?.code || 'ai_unavailable', err?.status || 503);
+      }
     }
 
     // Live Stage 16:9 Comment Stream across the whole room
@@ -661,13 +711,21 @@ export function application({ db, storage, getUser, BackendError }) {
       });
     }
 
-    const roomRoute = path.match(/^\/api\/rooms\/([a-z0-9-]{3,40})(\/reveal)?$/);
+    const roomRoute = path.match(/^\/api\/rooms\/([a-z0-9-]{3,40})(\/reveal|\/delete)?$/);
     if (roomRoute) {
       await seeded();
       const room = await roomBySlug(roomRoute[1]);
       const code = roomCode(request);
       assertAccess(room, ident, code);
+      if (roomRoute[2] === '/delete' && method === 'POST') {
+        requireAccount(ident);
+        if (!isActor(ident, room.creator_id)) fail('forbidden', 403);
+        const updated = rows(await db.from('rooms').update({ visibility: 'deleted' }).eq('id', room.id).select('id,visibility'));
+        if (!updated?.length) fail('not_found', 404);
+        return Response.json({ slug: room.slug, deleted: true });
+      }
       if (roomRoute[2] === '/reveal' && method === 'POST') {
+        requireAccount(ident);
         if (room.mode !== 'blind') fail('invalid_mode', 409);
         if (room.revealed) return Response.json({ revealed: true });
         const updated = rows(await db.from('rooms').update({ revealed: true }).eq('id', room.id).eq('revealed', false).select('id,revealed'));
@@ -681,7 +739,7 @@ export function application({ db, storage, getUser, BackendError }) {
     const uploadRoute = path.match(/^\/api\/rooms\/([a-z0-9-]{3,40})\/uploads$/);
     if (uploadRoute && method === 'POST') {
       await seeded();
-      const voterId = requireVisitor(ident);
+      const voterId = requireAccount(ident);
       const room = await roomBySlug(uploadRoute[1]);
       assertAccess(room, ident, roomCode(request));
       const body = await input(request);
@@ -704,47 +762,84 @@ export function application({ db, storage, getUser, BackendError }) {
       const origWidth = keepOriginal ? (Number(body?.original_width) || width) : width;
       const origHeight = keepOriginal ? (Number(body?.original_height) || height) : height;
       const origType = keepOriginal && IMAGE_TYPES.includes(body?.original_type) ? body.original_type : body.content_type;
-      if (keepOriginal && (!Number.isSafeInteger(origSize) || origSize < 1 || origSize > MAX_ORIGINAL)) fail('invalid_upload', 422);
+      const rawParts = keepOriginal && Array.isArray(body?.original_parts) ? body.original_parts.map(Number) : null;
+      const isChunked = Boolean(rawParts && rawParts.length > 0);
+      const origSha256 = typeof body?.original_sha256 === 'string' && /^[a-f0-9]{64}$/.test(body.original_sha256) ? body.original_sha256 : '';
+      if (keepOriginal) {
+        if (isChunked) {
+          if (rawParts.length < 2 || rawParts.length > MAX_PARTS || !origSha256) fail('invalid_upload', 422);
+          let partSum = 0;
+          for (const partSize of rawParts) {
+            if (!Number.isSafeInteger(partSize) || partSize < 1 || partSize > MAX_ORIGINAL) fail('invalid_upload', 422);
+            partSum += partSize;
+          }
+          if (!Number.isSafeInteger(origSize) || origSize !== partSum || origSize > MAX_CHUNKED_ORIGINAL) fail('invalid_upload', 422);
+        } else if (!Number.isSafeInteger(origSize) || origSize < 1 || origSize > MAX_ORIGINAL) {
+          fail('invalid_upload', 422);
+        }
+      }
 
       if (Number(room.moment_count) >= 200) fail('room_full', 409);
 
-      // Server-side safety & AI caption confirmation
-      const judged = await judgeMomentSubmission({
-        room, tag, place: place.trim(), story: story.trim(),
-        fileName: typeof body?.file_name === 'string' ? body.file_name : '',
-        telemetry: body?.telemetry,
-      });
-      if (!judged.allowed) fail('unsafe_content', 422);
-      if (judged.off_topic && body?.force_keep !== true) fail('off_topic_moment', 422);
-
-      const aiScore = typeof body?.ai_score === 'number' && body.ai_score >= 1 && body.ai_score <= 100 ? Math.round(body.ai_score) : judged.score;
+      // Server-side text safety guard (never fake-block or overwrite real vision captions)
+      if (hasUnsafeText(`${place} ${story} ${body?.file_name || ''}`)) fail('unsafe_content', 422);
+      const aiScore = typeof body?.ai_score === 'number' && body.ai_score >= 1 && body.ai_score <= 100 ? Math.round(body.ai_score) : 0;
       const aiCaption = typeof body?.ai_caption === 'string' && body.ai_caption.trim().length > 0 && clean(body.ai_caption, 80)
         ? body.ai_caption.trim()
-        : judged.caption;
+        : '';
 
       const id = crypto.randomUUID();
+      const nowIso = new Date().toISOString();
       const objectPath = `moments/${id}/full`, thumbPath = `moments/${id}/thumb`;
-      const originalPath = keepOriginal && origSize > 0 ? `moments/${id}/orig` : null;
+      const originalPath = keepOriginal && origSize > 0 ? (isChunked ? `chunked:${id}` : `moments/${id}/orig`) : null;
       rows(await db.from('moments').insert({
         id, room_id: room.id, author_id: voterId, author_name: authorName,
         place: place.trim(), tag, story: story.trim(),
         seed_key: null, object_path: objectPath, thumb_path: thumbPath,
         original_path: originalPath, original_width: origWidth, original_height: origHeight,
         ai_score: aiScore, ai_caption: aiCaption,
-        status: 'pending', width, height, likes: 0, votes: 0, comment_count: 0, created_at: new Date().toISOString(),
+        status: 'pending', width, height, likes: 0, votes: 0, comment_count: 0, created_at: nowIso,
       }));
-      let full, thumb, original = null;
+      if (isChunked && rawParts) {
+        for (let idx = 0; idx < rawParts.length; idx++) {
+          rows(await db.from('moment_parts').insert({
+            id: crypto.randomUUID(),
+            moment_id: id,
+            part_index: idx,
+            total_parts: rawParts.length,
+            object_path: `moments/${id}/part-${idx}`,
+            byte_size: rawParts[idx],
+            total_size: origSize,
+            content_type: origType,
+            sha256: origSha256,
+            created_at: nowIso,
+          }));
+        }
+      }
+      let full, thumb, original = null, original_parts = null;
       try {
         full = await storage.createSignedUploadUrl(objectPath, { upsert: false, contentType: body.content_type });
         thumb = await storage.createSignedUploadUrl(thumbPath, { upsert: false, contentType: 'image/jpeg' });
-        if (originalPath) original = await storage.createSignedUploadUrl(originalPath, { upsert: false, contentType: origType });
+        if (originalPath && !isChunked) {
+          original = await storage.createSignedUploadUrl(originalPath, { upsert: false, contentType: origType });
+        } else if (isChunked && rawParts) {
+          original_parts = [];
+          for (let idx = 0; idx < rawParts.length; idx++) {
+            const signedPart = await storage.createSignedUploadUrl(`moments/${id}/part-${idx}`, { upsert: false, contentType: 'application/octet-stream' });
+            original_parts.push({ index: idx, signedUrl: signedPart.signedUrl });
+          }
+        }
       } catch { fail('storage_unavailable', 503); }
-      return Response.json({ id, full, thumb, original, ai_score: aiScore, ai_caption: aiCaption, max_full: MAX_FULL, max_thumb: MAX_THUMB, max_original: MAX_ORIGINAL }, { status: 201 });
+      return Response.json({
+        id, full, thumb, original, original_parts,
+        ai_score: aiScore, ai_caption: aiCaption,
+        max_full: MAX_FULL, max_thumb: MAX_THUMB, max_original: MAX_CHUNKED_ORIGINAL,
+      }, { status: 201 });
     }
 
     const completeRoute = path.match(/^\/api\/moments\/([0-9a-f-]{36})\/complete$/);
     if (completeRoute && method === 'POST') {
-      const voterId = requireVisitor(ident);
+      const voterId = requireAccount(ident);
       if (!isUuid(completeRoute[1])) fail('invalid_input', 400);
       const moment = await one('moments', MOMENT_COLS, [['id', completeRoute[1]]]);
       if (!moment) fail('not_found', 404);
@@ -755,7 +850,22 @@ export function application({ db, storage, getUser, BackendError }) {
       if (moment.status === 'ready') return Response.json({ id: moment.id, status: 'ready' });
       await verifyImage(moment.object_path, MAX_FULL);
       await verifyImage(moment.thumb_path, MAX_THUMB);
-      if (moment.original_path) await verifyImage(moment.original_path, MAX_ORIGINAL);
+      if (moment.original_path) {
+        if (moment.original_path.startsWith('chunked:')) {
+          const parts = rows(await db.from('moment_parts').select(PART_COLS).eq('moment_id', moment.id).order('part_index', { ascending: true }).limit(MAX_PARTS + 1)) || [];
+          if (!parts.length || parts.length !== Number(parts[0].total_parts)) fail('upload_pending', 409);
+          let totalBytes = 0;
+          for (let idx = 0; idx < parts.length; idx++) {
+            const part = parts[idx];
+            if (Number(part.part_index) !== idx) fail('invalid_upload', 422);
+            await verifyChunk(part.object_path, Number(part.byte_size));
+            totalBytes += Number(part.byte_size);
+          }
+          if (totalBytes !== Number(parts[0].total_size) || totalBytes > MAX_CHUNKED_ORIGINAL) fail('invalid_upload', 422);
+        } else {
+          await verifyImage(moment.original_path, MAX_ORIGINAL);
+        }
+      }
       const updated = rows(await db.from('moments').update({ status: 'ready' }).eq('id', moment.id).eq('author_id', voterId).eq('status', 'pending').select('id,status'));
       if (!updated?.length) fail('write_conflict', 409);
       await bump('rooms', room.id, 'moment_count', 1);
@@ -765,11 +875,33 @@ export function application({ db, storage, getUser, BackendError }) {
       return Response.json({ id: moment.id, status: 'ready', slug: room.slug });
     }
 
+    const partsRoute = path.match(/^\/api\/moments\/([0-9a-f-]{36})\/original-parts$/);
+    if (partsRoute && method === 'GET') {
+      const { moment } = await momentInRoom(partsRoute[1], request, ident);
+      if (typeof moment.original_path !== 'string' || !moment.original_path.startsWith('chunked:')) fail('not_found', 404);
+      const parts = rows(await db.from('moment_parts').select(PART_COLS).eq('moment_id', moment.id).order('part_index', { ascending: true }).limit(MAX_PARTS + 1)) || [];
+      if (!parts.length) fail('not_found', 404);
+      const signedParts = [];
+      try {
+        for (const part of parts) {
+          const signed = await storage.createSignedUrl(part.object_path, 3600);
+          signedParts.push({ index: Number(part.part_index), size: Number(part.byte_size), signedUrl: signed.signedUrl });
+        }
+      } catch { fail('storage_unavailable', 503); }
+      return Response.json({
+        total_size: Number(parts[0].total_size),
+        total_parts: Number(parts[0].total_parts),
+        content_type: parts[0].content_type || 'image/jpeg',
+        sha256: parts[0].sha256 || '',
+        parts: signedParts,
+      });
+    }
+
     const deleteMomentRoute = path.match(/^\/api\/moments\/([0-9a-f-]{36})\/delete$/);
     if (deleteMomentRoute && method === 'POST') {
-      const voterId = requireVisitor(ident);
+      requireAccount(ident);
       const { moment, room } = await momentInRoom(deleteMomentRoute[1], request, ident);
-      if (moment.author_id !== voterId && room.creator_id !== voterId) fail('forbidden', 403);
+      if (!isActor(ident, moment.author_id) && !isActor(ident, room.creator_id)) fail('forbidden', 403);
       const updated = rows(await db.from('moments').update({ status: 'deleted' }).eq('id', moment.id).eq('status', 'ready').select('id,status'));
       if (!updated?.length) fail('not_found', 404);
       await bump('rooms', room.id, 'moment_count', -1);
@@ -788,6 +920,7 @@ export function application({ db, storage, getUser, BackendError }) {
       const images = await signImages([moment]);
       const state = await myState(room, ident);
       state.voterId = ident.id;
+      state.ident = ident;
       const all = rows(await db.from('moments').select('id,votes,likes,created_at').eq('room_id', room.id).eq('status', 'ready').limit(200)) || [];
       const ranks = rankMap(all);
       const profiles = await loadProfiles([moment.author_id]);
@@ -801,7 +934,7 @@ export function application({ db, storage, getUser, BackendError }) {
 
     const likeRoute = path.match(/^\/api\/moments\/([0-9a-f-]{36})\/like$/);
     if (likeRoute && method === 'POST') {
-      const voterId = requireVisitor(ident);
+      const voterId = requireAccount(ident);
       const { moment, room } = await momentInRoom(likeRoute[1], request, ident);
       const existing = await one('likes', 'id,active', [['moment_id', moment.id], ['voter_id', voterId]]);
       let liked;
@@ -820,7 +953,7 @@ export function application({ db, storage, getUser, BackendError }) {
 
     const voteRoute = path.match(/^\/api\/moments\/([0-9a-f-]{36})\/(vote|unvote)$/);
     if (voteRoute && method === 'POST') {
-      const voterId = requireVisitor(ident);
+      const voterId = requireAccount(ident);
       const { moment, room } = await momentInRoom(voteRoute[1], request, ident);
       if (room.mode === 'gentle') fail('invalid_mode', 409);
       const casting = voteRoute[2] === 'vote';
@@ -850,7 +983,7 @@ export function application({ db, storage, getUser, BackendError }) {
       return Response.json({ comments: await commentList(moment.id) });
     }
     if (commentRoute && method === 'POST') {
-      const voterId = requireVisitor(ident);
+      const voterId = requireAccount(ident);
       const { moment, room } = await momentInRoom(commentRoute[1], request, ident);
       const body = await input(request);
       const authorName = ident.account ? ident.account.display_name : (typeof body?.author_name === 'string' ? body.author_name.trim() : '');

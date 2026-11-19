@@ -1,7 +1,7 @@
 import { accountToken, visitorKey, type CachedAccount } from "@/src/lib/visitor";
 import type { ImageTelemetry } from "@/src/lib/image";
-import { cacheMomentAi, getCachedMomentAi, localGenerateAward, localGenerateVibe, localJudgeSubmission, SEED_MOMENT_AI, SEED_ROOM_NOTES } from "@/src/lib/aiFallback";
-import type { ModeId, ThemeId, Visibility } from "@/src/theme";
+import { cacheMomentAi, getCachedMomentAi, SEED_MOMENT_AI, SEED_ROOM_NOTES } from "@/src/lib/aiFallback";
+import type { ModeId, ThemeId, Visibility } from "@/src/config/theme";
 
 export type Account = CachedAccount;
 
@@ -15,7 +15,7 @@ export type Room = {
 export type Moment = {
   id: string; author_name: string; author_avatar: string; author_handle: string; author_uid: string;
   place: string; tag: string; story: string; width: number; height: number;
-  original_width: number; original_height: number; has_original: boolean;
+  original_width: number; original_height: number; has_original: boolean; original_chunked: boolean;
   ai_score: number; ai_caption: string;
   likes: number; comment_count: number; votes: number | null; rank: number | null; created_at: string;
   seed_key: string | null; image_url: string | null; thumb_url: string | null; original_url: string | null;
@@ -41,14 +41,22 @@ export type UploadIntent = {
   full: { signedUrl: string };
   thumb: { signedUrl: string };
   original: { signedUrl: string } | null;
+  original_parts: { index: number; signedUrl: string }[] | null;
   ai_score: number;
   ai_caption: string;
 };
+export type OriginalPartsManifest = {
+  total_size: number;
+  total_parts: number;
+  content_type: string;
+  sha256: string;
+  parts: { index: number; size: number; signedUrl: string }[];
+};
 export type RoomVibe = {
-  title: string; tagline: string; theme: ThemeId; mode: ModeId; visibility: Visibility; tags: string[]; reason: string;
+  title: string; tagline: string; theme: ThemeId; mode: ModeId; visibility: Visibility; tags: string[]; reason: string; model?: string;
 };
 export type AiJudgeVerdict = {
-  allowed: boolean; off_topic: boolean; score: number; reason: string; caption: string;
+  allowed: boolean; off_topic: boolean; score: number; reason: string; caption: string; engine?: string; model?: string;
 };
 
 export class RequestError extends Error {
@@ -145,14 +153,15 @@ function moment(value: unknown): Moment {
     original_width: num(value.original_width, cached?.origW ?? w),
     original_height: num(value.original_height, cached?.origH ?? h),
     has_original: value.has_original === undefined ? Boolean(seedKey || cached?.origW) : bool(value.has_original),
-    ai_score: num(value.ai_score, cached?.score ?? seedMeta?.score ?? 94),
+    original_chunked: bool(value.original_chunked),
+    ai_score: num(value.ai_score, cached?.score ?? seedMeta?.score ?? 0),
     ai_caption: str(value.ai_caption) || cached?.caption || seedMeta?.caption || "",
     likes: num(value.likes), comment_count: num(value.comment_count),
     votes: nullableNum(value.votes), rank: nullableNum(value.rank), created_at: str(value.created_at),
     seed_key: seedKey,
     image_url: imageUrl,
     thumb_url: typeof value.thumb_url === "string" ? value.thumb_url : null,
-    original_url: typeof value.original_url === "string" ? value.original_url : imageUrl,
+    original_url: bool(value.original_chunked) ? null : (typeof value.original_url === "string" ? value.original_url : imageUrl),
     liked: bool(value.liked), voted: bool(value.voted), mine: bool(value.mine),
     can_delete: value.can_delete === undefined ? bool(value.mine) : bool(value.can_delete),
   };
@@ -219,55 +228,42 @@ export const api = {
     if (!acc) throw new RequestError("invalid_response");
     return acc;
   },
-  async aiVibe(prompt: string): Promise<RoomVibe> {
-    try {
-      const body = await request("/api/ai/vibe", { method: "POST", body: { prompt } });
-      if (!isRecord(body) || !isRecord(body.vibe)) throw new RequestError("invalid_response");
-      const v = body.vibe;
-      return {
-        title: str(v.title),
-        tagline: str(v.tagline),
-        theme: (["amber", "ginkgo", "geek", "neon", "mint"].includes(str(v.theme)) ? v.theme : "amber") as ThemeId,
-        mode: (["gentle", "ballot", "blind"].includes(str(v.mode)) ? v.mode : "ballot") as ModeId,
-        visibility: v.visibility === "private" ? "private" : "public",
-        tags: strings(v.tags).slice(0, 4),
-        reason: str(v.reason),
-      };
-    } catch (err) {
-      if (err instanceof RequestError && err.status === 404) return localGenerateVibe(prompt);
-      throw err;
-    }
+  async aiVibe(prompt: string, opts?: { surprise?: boolean; avoid?: string[] }): Promise<RoomVibe> {
+    const body = await request("/api/ai/vibe", {
+      method: "POST",
+      body: { prompt, surprise: Boolean(opts?.surprise), avoid: opts?.avoid },
+    });
+    if (!isRecord(body) || !isRecord(body.vibe)) throw new RequestError("invalid_response");
+    const v = body.vibe;
+    return {
+      title: str(v.title),
+      tagline: str(v.tagline),
+      theme: (["amber", "ginkgo", "geek", "neon", "mint"].includes(str(v.theme)) ? v.theme : "amber") as ThemeId,
+      mode: (["gentle", "ballot", "blind"].includes(str(v.mode)) ? v.mode : "ballot") as ModeId,
+      visibility: v.visibility === "private" ? "private" : "public",
+      tags: strings(v.tags).slice(0, 4),
+      reason: str(v.reason),
+      model: str(v.model) || undefined,
+    };
   },
-  async aiJudge(slug: string, code: string | null, roomMeta: { title: string; theme: ThemeId }, payload: { tag: string; place: string; story: string; file_name: string; telemetry: ImageTelemetry }): Promise<AiJudgeVerdict> {
-    try {
-      const body = await request(`/api/rooms/${slug}/ai-judge`, { method: "POST", code, body: payload });
-      if (!isRecord(body) || !isRecord(body.verdict)) throw new RequestError("invalid_response");
-      const v = body.verdict;
-      return {
-        allowed: bool(v.allowed),
-        off_topic: bool(v.off_topic),
-        score: num(v.score, 92),
-        reason: str(v.reason),
-        caption: str(v.caption),
-      };
-    } catch (err) {
-      if (err instanceof RequestError && err.status === 404) {
-        return localJudgeSubmission(roomMeta.title, roomMeta.theme, payload);
-      }
-      throw err;
-    }
+  async aiJudge(slug: string, code: string | null, _roomMeta: { title: string; theme: ThemeId }, payload: { tag: string; place: string; story: string; file_name: string; image_data_url?: string }): Promise<AiJudgeVerdict> {
+    const body = await request(`/api/rooms/${slug}/ai-judge`, { method: "POST", code, body: payload });
+    if (!isRecord(body) || !isRecord(body.verdict)) throw new RequestError("invalid_response");
+    const v = body.verdict;
+    return {
+      allowed: bool(v.allowed),
+      off_topic: bool(v.off_topic),
+      score: num(v.score, 0),
+      reason: str(v.reason),
+      caption: str(v.caption),
+      engine: str(v.engine) || undefined,
+      model: str(v.model) || undefined,
+    };
   },
-  async aiAward(slug: string, code: string | null, fallbackCtx: { title: string; mode: ModeId; revealed: boolean; moments: Moment[] }): Promise<string> {
-    try {
-      const body = await request(`/api/rooms/${slug}/ai-award`, { method: "POST", code, body: {} });
-      if (!isRecord(body)) throw new RequestError("invalid_response");
-      return str(body.ai_curator_note);
-    } catch (err) {
-      if (err instanceof RequestError && err.status === 404) {
-        return localGenerateAward(fallbackCtx.title, fallbackCtx.mode, fallbackCtx.revealed, fallbackCtx.moments);
-      }
-      throw err;
-    }
+  async aiAward(slug: string, code: string | null, _fallbackCtx: { title: string; mode: ModeId; revealed: boolean; moments: Moment[] }): Promise<string> {
+    const body = await request(`/api/rooms/${slug}/ai-award`, { method: "POST", code, body: {} });
+    if (!isRecord(body)) throw new RequestError("invalid_response");
+    return str(body.ai_curator_note);
   },
   async roomFeed(slug: string, code: string | null, momentsFallback: Moment[], signal?: AbortSignal): Promise<Comment[]> {
     try {
@@ -347,6 +343,7 @@ export const api = {
     author_name: string; place: string; tag: string; story: string;
     width: number; height: number; size: number; thumb_size: number; content_type: string;
     keep_original?: boolean; original_size?: number; original_width?: number; original_height?: number; original_type?: string;
+    original_parts?: number[]; original_sha256?: string;
     file_name?: string; telemetry?: ImageTelemetry; ai_score?: number; ai_caption?: string; force_keep?: boolean;
   }): Promise<UploadIntent> {
     const body = await request(`/api/rooms/${slug}/uploads`, { method: "POST", code, body: payload });
@@ -354,11 +351,15 @@ export const api = {
     const score = num(body.ai_score, payload.ai_score ?? 94);
     const caption = str(body.ai_caption) || payload.ai_caption || "";
     cacheMomentAi(body.id, score, caption, payload.original_width ?? payload.width, payload.original_height ?? payload.height);
+    const rawParts = list(body.original_parts)
+      .filter((item): item is Record<string, unknown> => isRecord(item) && typeof item.signedUrl === "string")
+      .map((item, idx) => ({ index: num(item.index, idx), signedUrl: signed(item) }));
     return {
       id: body.id,
       full: { signedUrl: signed(body.full) },
       thumb: { signedUrl: signed(body.thumb) },
       original: isRecord(body.original) && typeof body.original.signedUrl === "string" ? { signedUrl: signed(body.original) } : null,
+      original_parts: rawParts.length ? rawParts : null,
       ai_score: score,
       ai_caption: caption,
     };
@@ -368,8 +369,26 @@ export const api = {
     if (!isRecord(body) || typeof body.id !== "string") throw new RequestError("invalid_response");
     return { id: body.id, status: str(body.status), slug: typeof body.slug === "string" ? body.slug : undefined };
   },
+  async originalParts(id: string, code: string | null): Promise<OriginalPartsManifest> {
+    const body = await request(`/api/moments/${id}/original-parts`, { code });
+    if (!isRecord(body)) throw new RequestError("invalid_response");
+    const parts = list(body.parts)
+      .filter((item): item is Record<string, unknown> => isRecord(item) && typeof item.signedUrl === "string")
+      .map((item, idx) => ({ index: num(item.index, idx), size: num(item.size), signedUrl: signed(item) }));
+    if (!parts.length) throw new RequestError("invalid_response");
+    return {
+      total_size: num(body.total_size),
+      total_parts: num(body.total_parts, parts.length),
+      content_type: str(body.content_type, "image/jpeg"),
+      sha256: str(body.sha256),
+      parts,
+    };
+  },
   async deleteMoment(id: string, code: string | null): Promise<void> {
     await request(`/api/moments/${id}/delete`, { method: "POST", code });
+  },
+  async deleteRoom(slug: string, code: string | null): Promise<void> {
+    await request(`/api/rooms/${slug}/delete`, { method: "POST", code });
   },
 };
 
@@ -414,7 +433,7 @@ export function message(error: unknown): string {
     comment_limit_reached: "短评数量已达上限。",
     unsafe_content: "AI 安全守门员拦截：检测到疑似推广或不当词汇，请修改后重试。",
     off_topic_moment: "AI 命题契合度裁判提示该图片与房间主题偏离较大，请换一张契合照片或勾选强行留存。",
-    invalid_upload: "图片格式或大小不符合要求（JPEG / PNG / WebP，原图不超过 10 MB）。",
+    invalid_upload: "图片格式或大小不符合要求（JPEG / PNG / WebP，原图最高 60 MB）。",
     upload_pending: "图片还没确认入库，请点击「继续完成上传」核对，不要重新上传。",
     object_exists: "这份图片已经上传过了，请直接完成确认。",
     upload_failed: "图片传输失败，请重试。",
@@ -429,6 +448,8 @@ export function message(error: unknown): string {
     forbidden: "这个操作只能由上传者本人完成。",
     login_required: "请先登录拾光账号后再试。",
     invalid_user_context: "登录状态已失效，请刷新页面。",
+    ai_not_configured: "站点尚未配置云端大模型密钥，暂无法使用 AI 生成。",
+    ai_unavailable: "云端 AI 暂时未响应，请稍后再试或手动填写。",
   } as Record<string, string>)[code] ?? "暂时无法完成操作，请稍后重试。";
 }
 

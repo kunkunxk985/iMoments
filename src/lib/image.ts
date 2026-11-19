@@ -1,6 +1,8 @@
-// Browser-side image processor + lightweight visual telemetry extractor for AI topic resonance check.
+// Browser-side image processor, visual telemetry extractor & 60 MiB chunked lossless slicer.
 export const ACCEPTED = ["image/jpeg", "image/png", "image/webp"];
-const MAX_SOURCE = 10 * 1024 * 1024; // platform Storage per-object ceiling (10 MiB)
+export const MAX_SINGLE_ORIGINAL = 9.5 * 1024 * 1024; // <= 9.5 MiB uploads as 1 object
+export const CHUNK_BYTES = 9 * 1024 * 1024; // 9 MiB per chunk (under platform 10 MiB object ceiling)
+export const MAX_SOURCE = 60 * 1024 * 1024; // 60 MiB lossless original ceiling (up to 7 chunks)
 const FULL_EDGE = 1600;
 const THUMB_EDGE = 620;
 
@@ -24,6 +26,20 @@ export type PreparedImage = {
   preview: string;
   telemetry: ImageTelemetry;
 };
+
+export function sliceOriginal(file: File): Blob[] {
+  const parts: Blob[] = [];
+  for (let offset = 0; offset < file.size; offset += CHUNK_BYTES) {
+    parts.push(file.slice(offset, Math.min(file.size, offset + CHUNK_BYTES), "application/octet-stream"));
+  }
+  return parts;
+}
+
+export async function sha256Blob(blob: Blob): Promise<string> {
+  const buf = await blob.arrayBuffer();
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+}
 
 function fit(width: number, height: number, edge: number) {
   const scale = Math.min(1, edge / Math.max(width, height));
@@ -133,7 +149,7 @@ export function uploadErrorMessage(error: unknown): string {
   const code = error instanceof Error ? error.message : "";
   return ({
     unsupported_type: "只支持 JPEG、PNG 或 WebP 图片。",
-    source_too_large: "原图超过 10 MB（站点存储单文件上限），请先压缩后再上传。",
+    source_too_large: "原图超过 60 MB 上限，请先适度压缩后再上传。",
     decode_failed: "这张图片无法在浏览器里解码，换一张试试。",
     canvas_unavailable: "当前浏览器无法处理图片，请更换浏览器。",
     encode_failed: "图片压缩失败，请重试或换一张。",

@@ -125,3 +125,18 @@ CREATE TABLE app.sessions (
   created_at timestamptz NOT NULL
 );
 CREATE INDEX sessions_account_id_idx ON app.sessions (account_id);
+
+CREATE TABLE app.moment_parts (
+  id uuid PRIMARY KEY,
+  moment_id uuid NOT NULL,
+  part_index integer NOT NULL,
+  total_parts integer NOT NULL,
+  object_path text NOT NULL UNIQUE,
+  byte_size integer NOT NULL,
+  total_size integer NOT NULL,
+  content_type text NOT NULL,
+  sha256 text NOT NULL,
+  created_at timestamptz NOT NULL,
+  UNIQUE (moment_id, part_index)
+);
+CREATE INDEX moment_parts_moment_id_idx ON app.moment_parts (moment_id, part_index);

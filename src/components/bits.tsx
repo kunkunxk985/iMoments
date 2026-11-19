@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { CrownIcon, EyeOffIcon, GiftIcon, HeartHandshakeIcon, Loader2Icon, RefreshCwIcon, TicketIcon, TriangleAlertIcon } from "lucide-react";
-import { MODES, medalName, type ModeId } from "@/src/theme";
+import { MODES, medalName, type ModeId } from "@/src/config/theme";
 import { message } from "@/src/api";
 
 export const AVATAR_PRESETS: Record<string, { label: string; bg: string; glyph: string }> = {

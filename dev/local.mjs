@@ -23,6 +23,7 @@ const DEFAULTS = {
   gate_attempts: { fails: 0, window_start: () => new Date().toISOString() },
   accounts: { avatar_url: '', bio: '', unlocked_codes: [] },
   sessions: {},
+  moment_parts: { part_index: 0, total_parts: 1, byte_size: 0, total_size: 0, content_type: 'image/jpeg', sha256: '' },
 };
 const UNIQUE = {
   rooms: [['slug'], ['code'], ['share_code'], ['creator_id', 'idempotency_key']],
@@ -33,11 +34,12 @@ const UNIQUE = {
   gate_attempts: [['room_id', 'voter_id']],
   accounts: [['handle']],
   sessions: [['token_hash']],
+  moment_parts: [['object_path'], ['moment_id', 'part_index']],
 };
 const matches = (row, keys, values) => keys.every(key => row[key] === values[key]);
 
 export function createMemoryRuntime() {
-  const tables = { rooms: [], moments: [], likes: [], votes: [], ballots: [], comments: [], gate_attempts: [], accounts: [], sessions: [] };
+  const tables = { rooms: [], moments: [], likes: [], votes: [], ballots: [], comments: [], gate_attempts: [], accounts: [], sessions: [], moment_parts: [] };
   const objects = new Map(), signatures = new Map();
   const state = { visitor: null, user: null, failList: false, loseCreate: false, loseComplete: false, ballotConflict: false };
   function reset() {
