@@ -304,7 +304,7 @@ export function Room({ slug, route, version, account, onTheme }: { slug: string;
               <p className="g-hero-rule">{MODES[room.mode].rule}</p>
             </div>
             <div className="g-hero-side">
-              {room.mode !== "gentle" ? <Ballots remaining={data.me.remaining} /> : null}
+              {room.mode !== "gentle" && account ? <Ballots remaining={data.me.remaining} /> : null}
               <div className="g-hero-actions">
                 <button type="button" className="g-btn g-btn-primary g-btn-lg" onClick={() => { if (guardLogin("上传瞬间")) setParams({ upload: "1", m: null }); }}><CameraIcon />上传瞬间</button>
                 <button type="button" className="g-btn g-btn-stage" onClick={() => setParams({ stage: "1", m: null })} title="开启 16:9 现场流光投屏大屏">
@@ -388,7 +388,7 @@ export function Room({ slug, route, version, account, onTheme }: { slug: string;
           <Empty
             icon={<CameraIcon />}
             title="这个房间还没有作品"
-            text="上传第一张瞬间：填写昵称、地点、子标签和一句话故事，它会立刻成为房间封面，并出现在所有人的画廊里。"
+            text="上传第一张瞬间：选择照片、子标签和一句话故事，它会立刻成为房间封面，并出现在所有人的画廊里。"
             action={<button type="button" className="g-btn g-btn-theme g-btn-lg" onClick={() => { if (guardLogin("上传瞬间")) setParams({ upload: "1" }); }}><CameraIcon />上传第一张瞬间</button>}
           />
         ) : view === "gallery" || room.mode === "gentle" ? (

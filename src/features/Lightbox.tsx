@@ -197,7 +197,7 @@ export function Lightbox({
             <div className="g-lb-tools">
               <button type="button" className="g-btn g-btn-sm" disabled={Boolean(assemblingLabel)} onClick={() => void handleZoomToggle()}>
                 {assemblingLabel ? <Spinner size={13} /> : zoom ? <ZoomOutIcon /> : <ZoomInIcon />}
-                {assemblingLabel ? assemblingLabel : zoom ? "适应窗口" : "查看原图"}
+                {assemblingLabel ? assemblingLabel : zoom ? "已显示原图" : "查看原图"}
               </button>
               {moment.original_chunked ? (
                 <button type="button" className="g-btn g-btn-sm" disabled={Boolean(assemblingLabel)} onClick={() => void handleChunkedDownload()}>
@@ -288,7 +288,7 @@ export function Lightbox({
               ) : (
                 <span className="g-badge" title={MODES.gentle.rule}><HeartIcon />温柔共赏 · 不排名</span>
               )}
-              {canVote ? <span className="g-lb-remaining"><TicketIcon width={13} height={13} />剩 {remaining}/5 票</span> : null}
+              {canVote && account ? <span className="g-lb-remaining"><TicketIcon width={13} height={13} />剩 {remaining}/5 票</span> : null}
             </div>
 
             <div className="g-lb-comments" ref={listRef}>
